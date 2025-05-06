@@ -9,6 +9,9 @@ from flask import Flask, request, jsonify, render_template, send_from_directory,
 import os
 import random
 import pandas as pd
+import time
+import json
+import urllib.parse
 
 app = Flask(__name__, static_folder='static', template_folder='templates')
 
@@ -16,67 +19,105 @@ app = Flask(__name__, static_folder='static', template_folder='templates')
 movies = pickle.load(open('artifacts/movie_list.pkl', 'rb'))
 similarity = pickle.load(open('artifacts/similarity.pkl', 'rb'))
 
+# Use the provided API key
+TMDB_API_KEY = "c1a1248fca735c015639fb65afe3fde6"
+
 def fetch_poster(movie_id):
-    try:
-        # Log the movie ID being requested
-        print(f"Fetching poster for movie ID: {movie_id}")
-        
-        # Check if movie_id is valid
-        if not movie_id or pd.isna(movie_id):
-            print(f"Invalid movie ID: {movie_id}")
-            return f"https://via.placeholder.com/500x750/222222/e50914?text=No+Poster"
-        
-        # Convert to integer if necessary
+    """Fetch movie poster from TMDB API with retry logic"""
+    max_retries = 3
+    retry_count = 0
+    
+    while retry_count < max_retries:
         try:
-            movie_id = int(movie_id)
-        except (ValueError, TypeError):
-            print(f"Could not convert movie ID to integer: {movie_id}")
-            return f"https://via.placeholder.com/500x750/222222/e50914?text=Invalid+ID"
-        
-        # Make API request
-        api_key = "8265bd1679663a7ea12ac168da84d2e8"
-        url = f"https://api.themoviedb.org/3/movie/{movie_id}?api_key={api_key}&language=en-US"
-        print(f"Requesting URL: {url}")
-        response = requests.get(url, timeout=5)
-        
-        # Check response status
-        if response.status_code != 200:
-            print(f"API error: Status {response.status_code} for movie ID {movie_id}")
-            return f"https://via.placeholder.com/500x750/222222/e50914?text=API+Error+{response.status_code}"
+            print(f"Fetching poster for movie ID: {movie_id} (Attempt {retry_count + 1})")
             
-        data = response.json()
+            # Check if movie_id is valid
+            if not movie_id or pd.isna(movie_id):
+                print(f"Invalid movie ID: {movie_id}")
+                return get_placeholder_image("No Poster Available", movie_id)
+            
+            # Make API request
+            url = f"https://api.themoviedb.org/3/movie/{movie_id}?api_key={TMDB_API_KEY}&language=en-US"
+            response = requests.get(url, timeout=3)
+            
+            # Check response status
+            if response.status_code != 200:
+                print(f"API error: Status {response.status_code} for movie ID {movie_id}")
+                # For some errors, no point in retrying
+                if response.status_code in [401, 404]:
+                    return get_placeholder_image(f"Movie Not Found", movie_id)
+                # Otherwise, retry
+                retry_count += 1
+                if retry_count < max_retries:
+                    time.sleep(1)  # Wait before retrying
+                    continue
+                return get_placeholder_image(f"API Error", movie_id)
+                
+            data = response.json()
+            
+            # Check if poster path exists
+            if 'poster_path' in data and data['poster_path']:
+                poster_path = data['poster_path']
+                full_path = "https://image.tmdb.org/t/p/w500" + poster_path
+                print(f"Found poster: {full_path}")
+                return full_path
+            else:
+                print(f"No poster found for movie ID {movie_id}")
+                return get_placeholder_image(f"{data.get('title', 'No Title')}", movie_id)
         
-        # Check if poster path exists
-        if 'poster_path' in data and data['poster_path']:
-            poster_path = data['poster_path']
-            full_path = "https://image.tmdb.org/t/p/w500" + poster_path
-            print(f"Found poster: {full_path}")
-            return full_path
-        else:
-            print(f"No poster found for movie ID {movie_id}")
-            return f"https://via.placeholder.com/500x750/222222/e50914?text=No+Poster"
-    except requests.exceptions.Timeout:
-        print(f"Timeout error fetching poster for movie ID {movie_id}")
-        return f"https://via.placeholder.com/500x750/222222/e50914?text=Timeout"
-    except requests.exceptions.ConnectionError:
-        print(f"Connection error fetching poster for movie ID {movie_id}")
-        return f"https://via.placeholder.com/500x750/222222/e50914?text=Connection+Error"
-    except Exception as e:
-        print(f"Error fetching poster for movie ID {movie_id}: {e}")
-        return f"https://via.placeholder.com/500x750/222222/e50914?text=Error"
+        except requests.exceptions.Timeout:
+            print(f"Timeout error fetching poster for movie ID {movie_id}")
+            retry_count += 1
+            if retry_count < max_retries:
+                time.sleep(1)  # Wait before retrying
+                continue
+            return get_placeholder_image("Timeout", movie_id)
+            
+        except requests.exceptions.ConnectionError:
+            print(f"Connection error fetching poster for movie ID {movie_id}")
+            retry_count += 1
+            if retry_count < max_retries:
+                time.sleep(1)  # Wait before retrying
+                continue
+            return get_placeholder_image("Connection Error", movie_id)
+            
+        except Exception as e:
+            print(f"Error fetching poster for movie ID {movie_id}: {e}")
+            retry_count += 1
+            if retry_count < max_retries:
+                time.sleep(1)  # Wait before retrying
+                continue
+            return get_placeholder_image("Error", movie_id)
+
+def get_placeholder_image(message, movie_id):
+    """Generate a placeholder image URL with a message"""
+    encoded_message = urllib.parse.quote(message)
+    placeholder = f"https://via.placeholder.com/500x750/222222/e50914?text={encoded_message}"
+    return placeholder
 
 def recommend(movie):
-    index = movies[movies['title'] == movie].index[0]
-    distances = sorted(list(enumerate(similarity[index])), reverse=True, key=lambda x: x[1])
-    recommended_movie_names = []
-    recommended_movie_posters = []
-    for i in distances[1:6]:
-        # fetch the movie poster
-        movie_id = movies.iloc[i[0]].id
-        recommended_movie_posters.append(fetch_poster(movie_id))
-        recommended_movie_names.append(movies.iloc[i[0]].title)
+    try:
+        index = movies[movies['title'] == movie].index[0]
+        distances = sorted(list(enumerate(similarity[index])), reverse=True, key=lambda x: x[1])
+        recommended_movie_names = []
+        recommended_movie_posters = []
+        
+        for i in distances[1:6]:
+            # Get movie info
+            movie_id = int(movies.iloc[i[0]].id)
+            movie_title = movies.iloc[i[0]].title
+            
+            # Fetch the movie poster
+            poster_url = fetch_poster(movie_id)
+            
+            recommended_movie_posters.append(poster_url)
+            recommended_movie_names.append(movie_title)
 
-    return recommended_movie_names, recommended_movie_posters
+        return recommended_movie_names, recommended_movie_posters
+    except Exception as e:
+        print(f"Error in recommend function: {e}")
+        # Return empty recommendations in case of error
+        return [], []
 
 @app.route('/')
 def home():
@@ -113,5 +154,6 @@ if __name__ == '__main__':
     os.makedirs('static/css', exist_ok=True)
     os.makedirs('static/js', exist_ok=True)
     os.makedirs('static/images', exist_ok=True)
+    os.makedirs('artifacts', exist_ok=True)
     
     app.run(debug=True)
